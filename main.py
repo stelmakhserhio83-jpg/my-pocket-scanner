@@ -1,32 +1,29 @@
 import os
 import asyncio
+import json
 import requests
 from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
+import websockets
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8381163993:AAEaJ8256hIp33Gj3ooBM_a1p9p37wgQPog")
 CHAT_ID = os.getenv("CHAT_ID")
 
 SCANNER_ACTIVE = False
 
+# Основные OTC-активы Pocket Option
 FOREX_PAIRS = [
     "EUR/USD OTC", "GBP/USD OTC", "USD/JPY OTC", "AUD/CAD OTC", 
-    "EUR/GBP OTC", "USD/CHF OTC", "AUD/USD OTC", "NZD/USD OTC",
-    "CAD/JPY OTC", "GBP/JPY OTC", "EUR/JPY OTC", "USD/CAD OTC"
+    "EUR/GBP OTC", "USD/CHF OTC", "AUD/USD OTC", "NZD/USD OTC"
 ]
-
 STOCKS_PAIRS = [
     "Apple OTC", "Microsoft OTC", "Tesla OTC", "Amazon OTC", 
-    "Boeing OTC", "Google OTC", "Meta OTC", "Netflix OTC", 
-    "Intel OTC", "NVIDIA OTC", "AMD OTC", "Johnson & Johnson OTC"
+    "Boeing OTC", "Google OTC", "Meta OTC", "Netflix OTC"
 ]
 
-AI_MODEL_MEMORY = {
-    "SMC_M5_TREND_CONFIRMED_CALL": [8, 10, 0.80],
-    "SMC_M5_TREND_CONFIRMED_PUT": [7, 9, 0.77]
-}
+# Хранилище реальных свечей, поступающих из WebSocket Pocket Option
+MARKET_DATA = {}
 
-# Отправка нового сообщения (используется только для /start или push-сигналов)
 def send_telegram_message(text: str, reply_markup=None):
     if not BOT_TOKEN or not CHAT_ID:
         return False
@@ -41,17 +38,11 @@ def send_telegram_message(text: str, reply_markup=None):
         print(f"Error sending TG msg: {e}")
         return False
 
-# Редактирование существующего сообщения (чтобы интерфейс не уплывал вверх)
 def edit_telegram_message(message_id: int, text: str, reply_markup=None):
     if not BOT_TOKEN or not CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/editMessageText"
-    payload = {
-        "chat_id": CHAT_ID, 
-        "message_id": message_id, 
-        "text": text, 
-        "parse_mode": "HTML"
-    }
+    payload = {"chat_id": CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "HTML"}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     try:
@@ -65,15 +56,15 @@ def get_main_inline_keyboard():
     return {
         "inline_keyboard": [
             [
-                {"text": "💱 Валютные пары (Forex)", "callback_data": "cat_forex"},
-                {"text": "📈 Акции (Stocks)", "callback_data": "cat_stocks"}
+                {"text": "💱 Валютные пары (Forex OTC)", "callback_data": "cat_forex"},
+                {"text": "📈 Акции (Stocks OTC)", "callback_data": "cat_stocks"}
             ],
             [
                 {"text": "⚡️ Запустить сканер", "callback_data": "cmd_start"},
                 {"text": "🔴 Стоп сканер", "callback_data": "cmd_stop"}
             ],
             [
-                {"text": "📊 Статус и ИИ-память", "callback_data": "cmd_status"}
+                {"text": "📊 Статус WebSocket", "callback_data": "cmd_status"}
             ]
         ]
     }
@@ -101,18 +92,90 @@ def calculate_stochastic(candles, k_period=8, d_period=3):
         k_values.append(k)
     return k_values[-1], sum(k_values[-d_period:]) / d_period
 
-async def market_scanner_loop():
-    global SCANNER_ACTIVE
+# Фоновый коннектор к потоку котировок Pocket Option WebSocket
+async def pocket_option_ws_listener():
+    global MARKET_DATA
+    uri = "wss://hqindexer.pocketoption.com/socket.io/?EIO=4&transport=websocket"
     while True:
-        if SCANNER_ACTIVE:
-            try:
-                pass
-            except Exception as e:
-                print(f"Scanner Loop Error: {e}")
+        try:
+            async with websockets.connect(uri, ping_interval=20) as ws:
+                print("Connected to Pocket Option WS Feed")
+                async for message in ws:
+                    # Обработка входящих пакетов котировок брокера
+                    if message.startswith("42"):
+                        try:
+                            data = json.loads(message[2:])
+                            if isinstance(data, list) and len(data) > 1:
+                                event_name = data[0]
+                                event_payload = data[1]
+                                if event_name == "update_asset" or "rate" in str(event_payload):
+                                    # Парсим актив и цену из потока брокера
+                                    asset = event_payload.get("asset", "EUR/USD OTC")
+                                    price = float(event_payload.get("price", 0))
+                                    if price > 0:
+                                        if asset not in MARKET_DATA:
+                                            MARKET_DATA[asset] = []
+                                        MARKET_DATA[asset].append({
+                                            "open": price, "high": price, "low": price, "close": price
+                                        })
+                                        # Держим хвост свечей в памяти для расчета
+                                        if len(MARKET_DATA[asset]) > 100:
+                                            MARKET_DATA[asset].pop(0)
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"WS Connection Error: {e}")
+            await asyncio.sleep(5)
+
+def analyze_pocket_setup(pair_name):
+    candles = MARKET_DATA.get(pair_name, [])
+    if len(candles) < 15:
+        # Если данных из потока еще мало (только запустились), даем базовый срез из накопленного
+        return {
+            "status": "waiting",
+            "text": f"⏳ Актив {pair_name} калибрует потоковые котировки WS... Подождите 10 секунд и повторите клик."
+        }
+    
+    stoch_k, stoch_d = calculate_stochastic(candles)
+    last_price = candles[-1]['close']
+    prev_price = candles[-2]['close']
+    
+    m5_bullish = candles[-1]['close'] >= candles[max(0, len(candles)-5)]['close']
+    
+    signal = "CALL (ВВЕРХ) 🟢" if m5_bullish and stoch_k < 30 else ("PUT (НИЗ) 🔴" if not m5_bullish and stoch_k > 70 else "НЕЙТРАЛЬНО")
+    
+    return {
+        "status": "ok",
+        "pair": pair_name,
+        "price": last_price,
+        "stoch_k": round(stoch_k, 1),
+        "m5_trend": "Бычий 📈" if m5_bullish else "Медвежий 📉",
+        "signal": signal,
+        "exp": "1 мин"
+    }
+
+async def market_scanner_loop():
+    global SCANNER_ACTIVE, CHAT_ID
+    while True:
+        if SCANNER_ACTIVE and CHAT_ID:
+            for pair in FOREX_PAIRS:
+                res = analyze_pocket_setup(pair)
+                if res["status"] == "ok" and "НЕЙТРАЛЬНО" not in res["signal"]:
+                    msg = (
+                        f"🚨 <b>СИГНАЛ POCKET OPTION OTC!</b>\n\n"
+                        f"🎯 Актив: <b>{res['pair']}</b>\n"
+                        f"📊 Сигнал: <b>{res['signal']}</b>\n"
+                        f"⏱ Экспирация: <b>{res['exp']}</b>\n"
+                        f"📉 Цена: <code>{res['price']}</code>\n"
+                        f"📈 Stoch K: <b>{res['stoch_k']}</b>"
+                    )
+                    send_telegram_message(msg)
+                    await asyncio.sleep(5)
         await asyncio.sleep(15)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    asyncio.create_task(pocket_option_ws_listener())
     asyncio.create_task(market_scanner_loop())
     yield
 
@@ -128,41 +191,51 @@ async def telegram_webhook(request: Request):
     elif "callback_query" in data:
         CHAT_ID = str(data["callback_query"]["message"]["chat"]["id"])
 
-    # Обработка нажатий на кнопки (теперь меняется текущее сообщение, а не плодятся новые)
     if "callback_query" in data:
         cb = data["callback_query"]
         cb_data = cb.get("data", "")
         message_id = cb["message"]["message_id"]
         
         if cb_data == "cat_forex":
-            edit_telegram_message(message_id, "💱 <b>Выберите валютную пару OTC:</b>", get_pairs_keyboard(FOREX_PAIRS))
+            edit_telegram_message(message_id, "💱 <b>Выберите Forex OTC актив:</b>", get_pairs_keyboard(FOREX_PAIRS))
         elif cb_data == "cat_stocks":
-            edit_telegram_message(message_id, "📈 <b>Выберите акцию OTC:</b>", get_pairs_keyboard(STOCKS_PAIRS))
+            edit_telegram_message(message_id, "📈 <b>Выберите Stock OTC актив:</b>", get_pairs_keyboard(STOCKS_PAIRS))
         elif cb_data == "cat_main":
-            edit_telegram_message(message_id, "🎛 <b>Главное меню M5+S5 Smart Scanner:</b>", get_main_inline_keyboard())
+            edit_telegram_message(message_id, "🎛 <b>Главное меню Pocket Option WS Scanner:</b>", get_main_inline_keyboard())
         elif cb_data == "cmd_start":
             SCANNER_ACTIVE = True
-            edit_telegram_message(message_id, "⚡️ <b>Мультитаймфреймный сканер ЗАПУЩЕН!</b>\nФильтр M5 + Микроимпульсы S5 активны.", get_main_inline_keyboard())
+            edit_telegram_message(message_id, "⚡️ <b>WebSocket сканер Pocket Option ЗАПУЩЕН!</b>", get_main_inline_keyboard())
         elif cb_data == "cmd_stop":
             SCANNER_ACTIVE = False
             edit_telegram_message(message_id, "🔴 <b>Сканер остановлен.</b>", get_main_inline_keyboard())
         elif cb_data == "cmd_status":
-            state_str = "⚡️ АКТИВЕН" if SCANNER_ACTIVE else "🔴 НА ПАУЗЕ"
-            memory_info = "\n".join([f"• <code>{k}</code>: Винрейт {int(v[2]*100)}%" for k, v in AI_MODEL_MEMORY.items()])
-            edit_telegram_message(message_id, f"📊 <b>Статус:</b> {state_str}\n\n🧠 <b>ИИ-память сетапов:</b>\n{memory_info}", get_main_inline_keyboard())
+            active_pairs_count = len(MARKET_DATA)
+            edit_telegram_message(message_id, f"📊 <b>Статус WS:</b> Активных потоков пар в памяти: <b>{active_pairs_count}</b>", get_main_inline_keyboard())
         elif cb_data.startswith("scan_pair_"):
             pair_name = cb_data.replace("scan_pair_", "")
-            edit_telegram_message(message_id, f"🔍 <b>Анализ {pair_name}:</b>\n✅ Тренд M5 подтвержден.\n✅ 5-секундный микроимпульс пойман.\n⚡️ Ожидание идеальной точки входа.\n\n<i>Нажмите кнопку ниже для возврата:</i>", get_pairs_keyboard(FOREX_PAIRS if "EUR" in pair_name or "USD" in pair_name or "GBP" in pair_name or "AUD" in pair_name or "NZD" in pair_name or "CAD" in pair_name else STOCKS_PAIRS))
+            analysis = analyze_pocket_setup(pair_name)
+            
+            if analysis["status"] == "ok":
+                result_text = (
+                    f"🎯 <b>Анализ OTC: {analysis['pair']}</b>\n\n"
+                    f"💵 Цена: <code>{analysis['price']}</code>\n"
+                    f"📊 Stochastic K: <b>{analysis['stoch_k']}</b>\n"
+                    f"📈 Тренд: <b>{analysis['m5_trend']}</b>\n"
+                    f"💡 Вердикт: <b>{analysis['signal']}</b>"
+                )
+            else:
+                result_text = analysis["text"]
+                
+            back_cat = FOREX_PAIRS if pair_name in FOREX_PAIRS else STOCKS_PAIRS
+            edit_telegram_message(message_id, result_text, get_pairs_keyboard(back_cat))
 
     elif "message" in data and "text" in data["message"]:
         text = data["message"]["text"].strip()
         if text in ["/start", "/menu"]:
-            send_telegram_message("🎛 <b>Панель управления Multi-Timeframe Scanner:</b>", get_main_inline_keyboard())
-        elif text == "/status":
-            send_telegram_message(f"📊 <b>Статус:</b> Система функционирует штатно.")
+            send_telegram_message("🎛 <b>Панель управления Pocket Option WS Scanner:</b>", get_main_inline_keyboard())
                 
     return {"status": "ok"}
 
 @app.get("/")
 def read_root():
-    return {"status": "M5 + S5 Smart Scanner Running", "active": SCANNER_ACTIVE}
+    return {"status": "PO WebSocket Scanner Active", "tracked_assets": list(MARKET_DATA.keys())}
