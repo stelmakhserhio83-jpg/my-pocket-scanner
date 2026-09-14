@@ -1,6 +1,4 @@
 fastapi
 uvicorn
-python-telegram-bot
 requests
-pandas
-ta
+websockets
