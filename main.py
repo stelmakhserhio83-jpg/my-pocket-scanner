@@ -9,9 +9,18 @@ CHAT_ID = os.getenv("CHAT_ID")
 
 SCANNER_ACTIVE = False
 
-# Списки активов Pocket Option OTC
-FOREX_PAIRS = ["EUR/USD OTC", "GBP/USD OTC", "USD/JPY OTC", "AUD/CAD OTC", "EUR/GBP OTC"]
-STOCKS_PAIRS = ["Apple OTC", "Microsoft OTC", "Tesla OTC", "Amazon OTC", "Boeing OTC"]
+# Полный список OTC-активов Pocket Option (Forex & Stocks)
+FOREX_PAIRS = [
+    "EUR/USD OTC", "GBP/USD OTC", "USD/JPY OTC", "AUD/CAD OTC", 
+    "EUR/GBP OTC", "USD/CHF OTC", "AUD/USD OTC", "NZD/USD OTC",
+    "CAD/JPY OTC", "GBP/JPY OTC", "EUR/JPY OTC", "USD/CAD OTC"
+]
+
+STOCKS_PAIRS = [
+    "Apple OTC", "Microsoft OTC", "Tesla OTC", "Amazon OTC", 
+    "Boeing OTC", "Google OTC", "Meta (Facebook) OTC", "Netflix OTC", 
+    "Intel OTC", "NVIDIA OTC", "AMD OTC", "Johnson & Johnson OTC"
+]
 
 def send_telegram_message(text: str, reply_markup=None):
     if not BOT_TOKEN:
@@ -27,7 +36,6 @@ def send_telegram_message(text: str, reply_markup=None):
         print(f"Error sending TG msg: {e}")
         return False
 
-# Инлайн-клавиатура: Главное меню
 def get_main_inline_keyboard():
     return {
         "inline_keyboard": [
@@ -45,7 +53,6 @@ def get_main_inline_keyboard():
         ]
     }
 
-# Инлайн-клавиатура: Список пар
 def get_pairs_keyboard(pairs_list):
     keyboard = []
     for i in range(0, len(pairs_list), 2):
@@ -56,7 +63,6 @@ def get_pairs_keyboard(pairs_list):
     keyboard.append([{"text": "⬅️ Назад в меню", "callback_data": "cat_main"}])
     return {"inline_keyboard": keyboard}
 
-# Аналитика и индикаторы
 def calculate_stochastic(candles, k_period=8, d_period=3):
     if len(candles) < k_period + d_period:
         return 50, 50
@@ -102,13 +108,11 @@ async def telegram_webhook(request: Request):
     global SCANNER_ACTIVE, CHAT_ID
     data = await request.json()
     
-    # Авто-фиксация CHAT_ID из первого пришедшего сообщения/клика
     if "message" in data:
         CHAT_ID = str(data["message"]["chat"]["id"])
     elif "callback_query" in data:
         CHAT_ID = str(data["callback_query"]["message"]["chat"]["id"])
 
-    # Обработка кликов по кнопкам
     if "callback_query" in data:
         cb_data = data["callback_query"].get("data", "")
         
@@ -131,7 +135,6 @@ async def telegram_webhook(request: Request):
             pair_name = cb_data.replace("scan_pair_", "")
             send_telegram_message(f"🔍 <b>Анализирую {pair_name}...</b>\nПоиск сетапа SMC + ФВГ...")
 
-    # Обработка команд в тексте (/start, /status)
     elif "message" in data and "text" in data["message"]:
         text = data["message"]["text"].strip()
         if text in ["/start", "/menu"]:
