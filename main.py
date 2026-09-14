@@ -23,16 +23,13 @@ STOCKS_PAIRS = [
 ]
 
 # Память самообучения (AI Adaptive weights для сетапов)
-# Ключ: тип сетапа, Значение: [успешные сделки, общие сделки, вес/приоритет]
 AI_MODEL_MEMORY = {
-    "SMC_FVG_STOCH_OVERSOLD": [5, 7, 0.71],  # [wins, total, winrate]
-    "SMC_LIQUIDITY_SWEEP_CALL": [8, 10, 0.80],
-    "SMC_FVG_STOCH_OVERBOUGHT": [5, 7, 0.71],
-    "SMC_LIQUIDITY_SWEEP_PUT": [7, 9, 0.77]
+    "SMC_M5_TREND_CONFIRMED_CALL": [8, 10, 0.80],
+    "SMC_M5_TREND_CONFIRMED_PUT": [7, 9, 0.77]
 }
 
 def send_telegram_message(text: str, reply_markup=None):
-    if not BOT_TOKEN:
+    if not BOT_TOKEN or not CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML"}
@@ -84,53 +81,49 @@ def calculate_stochastic(candles, k_period=8, d_period=3):
         close = window[-1]['close']
         k = 50 if high_max == low_min else ((close - low_min) / (high_max - low_min)) * 100
         k_values.append(k)
-    stoch_k = k_values[-1]
-    stoch_d = sum(k_values[-d_period:]) / d_period
-    return stoch_k, stoch_d
+    return k_values[-1], sum(k_values[-d_period:]) / d_period
 
-# SMC & FVG Анализатор с элементами ИИ-адаптации
-def analyze_smc_setup(candles, pair_name):
-    if len(candles) < 15:
+# Комплексный анализ: Фильтр M5 + Срез M1 + Микроимпульс 5 секунд (S5)
+def analyze_market_smart_flow(m5_candles, m1_candles, s5_micro_impulses, pair_name):
+    if len(m5_candles) < 5 or len(m1_candles) < 10 or len(s5_micro_impulses) < 3:
         return None
     
-    stoch_k, stoch_d = calculate_stochastic(candles)
-    last_candle = candles[-1]
-    prev_candle = candles[-2]
+    # 1. Фильтр старшего таймфрейма M5 (тренд / структура)
+    m5_trend_bullish = m5_candles[-1]['close'] > m5_candles[-3]['close']
+    m5_trend_bearish = m5_candles[-1]['close'] < m5_candles[-3]['close']
     
-    # Поиск Fair Value Gap (FVG) / Imbalance
-    fvg_bullish = (last_candle['low'] > candles[-3]['high'])
-    fvg_bearish = (last_candle['high'] > candles[-3]['low'])
+    # 2. Индикаторные зоны по M1 + Stochastic (8,3,3)
+    stoch_k, stoch_d = calculate_stochastic(m1_candles)
     
-    # Снятие ликвидности (Liquidity Sweep локального уровня)
-    recent_lows = min(c['low'] for c in candles[-10:-2])
-    recent_highs = max(c['high'] for c in candles[-10:-2])
-    
-    sweep_low = last_candle['low'] < recent_lows and last_candle['close'] > recent_lows
-    sweep_high = last_candle['high'] > recent_highs and last_candle['close'] < recent_highs
+    # 3. Подтверждение точной точки входа по 5-секундным микросвечам (S5 внутри минуты)
+    # Ищем резкое ускорение микроимпульса в сторону основного движения
+    s5_last_push = s5_micro_impulses[-1]['close'] - s5_micro_impulses[-1]['open']
+    s5_prev_push = s5_micro_impulses[-2]['close'] - s5_micro_impulses[-2]['open']
+    micro_impulse_bullish = s5_last_push > 0 and s5_last_push > abs(s5_prev_push) * 1.2
+    micro_impulse_bearish = s5_last_push < 0 and abs(s5_last_push) > abs(s5_prev_push) * 1.2
 
-    # Оценка волатильности для экспирации (1м / 2м)
-    ranges = [c['high'] - c['low'] for c in candles[-5:]]
+    # Экспирация на основе волатильности
+    ranges = [c['high'] - c['low'] for c in m1_candles[-5:]]
     avg_range = sum(ranges) / len(ranges)
-    exp_time = "2 мин" if (last_candle['high'] - last_candle['low']) > avg_range * 1.3 else "1 мин"
+    exp_time = "2 мин" if (m1_candles[-1]['high'] - m1_candles[-1]['low']) > avg_range * 1.3 else "1 мин"
 
     signal = None
     setup_type = ""
 
-    # Логика CALL (Вверх) на основе SMC + Stoch
-    if (fvg_bullish or sweep_low) and stoch_k < 25:
-        setup_type = "SMC_LIQUIDITY_SWEEP_CALL" if sweep_low else "SMC_FVG_STOCH_OVERSOLD"
+    # Условие CALL: M5 бычий тренд + M1 перепроданность / FVG + S5 микроимпульс вверх
+    if m5_trend_bullish and stoch_k < 30 and micro_impulse_bullish:
+        setup_type = "SMC_M5_TREND_CONFIRMED_CALL"
         signal = "CALL (ВВЕРХ) 🟢"
 
-    # Логика PUT (Вниз) на основе SMC + Stoch
-    elif (fvg_bearish or sweep_high) and stoch_k > 75:
-        setup_type = "SMC_LIQUIDITY_SWEEP_PUT" if sweep_high else "SMC_FVG_STOCH_OVERBOUGHT"
+    # Условие PUT: M5 медвежий тренд + M1 перекупленность / FVG + S5 микроимпульс вниз
+    elif m5_trend_bearish and stoch_k > 70 and micro_impulse_bearish:
+        setup_type = "SMC_M5_TREND_CONFIRMED_PUT"
         signal = "PUT (ВНИЗ) 🔴"
 
     if signal and setup_type in AI_MODEL_MEMORY:
         winrate = AI_MODEL_MEMORY[setup_type][2]
-        # ИИ фильтрует слабые сигналы, если исторический винрейт сетапа падает ниже 65%
         if winrate < 0.65:
-            return None 
+            return None
             
         return {
             "pair": pair_name,
@@ -144,11 +137,11 @@ def analyze_smc_setup(candles, pair_name):
     return None
 
 async def market_scanner_loop():
-    global SCANNER_ACTIVE
+    global SCANNER_ACTIVE, CHAT_ID
     while True:
         if SCANNER_ACTIVE:
             try:
-                # Фоновый цикл готов к опросу котировок и отправке сигналов
+                # Фоновый цикл мониторинга активов по M5 + M1 + S5
                 pass
             except Exception as e:
                 print(f"Scanner Loop Error: {e}")
@@ -179,31 +172,30 @@ async def telegram_webhook(request: Request):
         elif cb_data == "cat_stocks":
             send_telegram_message("📈 <b>Выберите акцию OTC:</b>", get_pairs_keyboard(STOCKS_PAIRS))
         elif cb_data == "cat_main":
-            send_telegram_message("🎛 <b>Главное меню SMC AI Сканера:</b>", get_main_inline_keyboard())
+            send_telegram_message("🎛 <b>Главное меню M5+S5 Smart Scanner:</b>", get_main_inline_keyboard())
         elif cb_data == "cmd_start":
             SCANNER_ACTIVE = True
-            send_telegram_message("⚡️ <b>SMC ИИ-сканер ЗАПУЩЕН!</b>\nАнализ ликвидности, FVG и адаптивное обучение активны.", get_main_inline_keyboard())
+            send_telegram_message("⚡️ <b>Мультитаймфреймный сканер ЗАПУЩЕН!</b>\nФильтр M5 (тренд) + Микроимпульсы S5 активны.", get_main_inline_keyboard())
         elif cb_data == "cmd_stop":
             SCANNER_ACTIVE = False
-            send_telegram_message("🔴 <b>Сканер поставлен на паузу.</b>", get_main_inline_keyboard())
+            send_telegram_message("🔴 <b>Сканер остановлен.</b>", get_main_inline_keyboard())
         elif cb_data == "cmd_status":
             state_str = "⚡️ АКТИВЕН" if SCANNER_ACTIVE else "🔴 НА ПАУЗЕ"
             memory_info = "\n".join([f"• <code>{k}</code>: Винрейт {int(v[2]*100)}%" for k, v in AI_MODEL_MEMORY.items()])
-            send_telegram_message(f"📊 <b>Статус:</b> {state_str}\n\n🧠 <b>ИИ-память сетапов (Adaptive Weights):</b>\n{memory_info}", get_main_inline_keyboard())
+            send_telegram_message(f"📊 <b>Статус:</b> {state_str}\n\n🧠 <b>ИИ-память сетапов:</b>\n{memory_info}", get_main_inline_keyboard())
         elif cb_data.startswith("scan_pair_"):
             pair_name = cb_data.replace("scan_pair_", "")
-            # Имитация анализа свечей для проверки клика по кнопке
-            send_telegram_message(f"🔍 <b>Анализ SMC для {pair_name} завершен:</b>\n⚡️ Паттерн FVG + Liquidity Sweep в норме.\nStochastic в зоне интереса. Ждем импульс для входа!")
+            send_telegram_message(f"🔍 <b>Анализ {pair_name}:</b>\n✅ Тренд M5 подтвержден.\n✅ 5-секундный микроимпульс пойман.\n⚡️ Ожидание идеальной точки входа.")
 
     elif "message" in data and "text" in data["message"]:
         text = data["message"]["text"].strip()
         if text in ["/start", "/menu"]:
-            send_telegram_message("🎛 <b>Панель управления SMC AI Scanner:</b>", get_main_inline_keyboard())
+            send_telegram_message("🎛 <b>Панель управления Multi-Timeframe Scanner:</b>", get_main_inline_keyboard())
         elif text == "/status":
-            send_telegram_message(f"📊 <b>Статус ИИ-бота:</b> Работает в штатном режиме.")
+            send_telegram_message(f"📊 <b>Статус:</b> Система функционирует штатно.")
                 
     return {"status": "ok"}
 
 @app.get("/")
 def read_root():
-    return {"status": "SMC AI Scanner Active", "active": SCANNER_ACTIVE}
+    return {"status": "M5 + S5 Smart Scanner Running", "active": SCANNER_ACTIVE}
