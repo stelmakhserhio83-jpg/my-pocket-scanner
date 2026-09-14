@@ -1,6 +1,6 @@
-fastapi==0.103.2
-uvicorn==0.23.2
-python-telegram-bot==20.6
-requests==2.31.0
-pandas==2.1.1
-ta==0.10.2
+fastapi
+uvicorn
+python-telegram-bot
+requests
+pandas
+ta
